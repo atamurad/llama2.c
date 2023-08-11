@@ -13,6 +13,7 @@ $ ./run
 #include <time.h>
 #include <math.h>
 #include <string.h>
+#include <stdint.h>
 #include <fcntl.h>
 #if defined _WIN32
     #include "win.h"
@@ -49,22 +50,43 @@ typedef struct {
             float *means; // (n_rows / QK, n_cols)
             int8_t *q;
         } q8b;
+
+       struct {
+           float *bins;  // (16,)
+           uint8_t *q; // 2 nibbles packed
+       } q4a;
     } u;
 
 } QMatrix;
 
 #define QK          64          // Quantized block size, floats
 #define Q8_A_TYPE   0x615f3871  // ASCII 'q8_a'
+#define Q8_B_TYPE   0x625f3871  // ASCII 'q8_b'
+#define Q4_A_TYPE   0x615f3471  // ASCII 'q4_a'
 
-inline float q_index_float(QMatrix *w, int i, int j)
+float q_index_float(QMatrix *w, int i, int j)
 {
     float res;
+    int idx;
+    uint8_t nibble;
+
     // q8_a
-    if(w->qtype == Q8_A_TYPE) {
-        res = (w->u.q8a.scales[(i/QK)*w->n_cols + j]/127.0) * w->u.q8a.q[(i * w->n_cols + j)];
-    } else {
-        int idx = i*(w->n_cols/QK)+j/QK;
-        res = (w->u.q8b.scales[idx]/127.0) * w->u.q8b.q[i*w->n_cols+j] + w->u.q8b.means[idx];
+    switch(w->qtype) {
+        case Q8_A_TYPE:
+            res = (w->u.q8a.scales[(i/QK)*w->n_cols + j]/127.0) * w->u.q8a.q[(i * w->n_cols + j)];
+            break;
+
+        case Q8_B_TYPE:
+            idx = i*(w->n_cols/QK)+j/QK;
+            res = (w->u.q8b.scales[idx]/127.0) * w->u.q8b.q[i*w->n_cols+j] + w->u.q8b.means[idx];
+            break;
+
+        case Q4_A_TYPE:
+            idx = i*(w->n_cols/QK/2)*16 + (j/QK/2)*16;
+            nibble = w->u.q4a.q[i*(w->n_cols/2) + j/2];
+            nibble = (j % 2 == 0) ? (nibble >> 4) : (nibble & 0x0F);
+            res = w->u.q4a.bins[idx+nibble];
+            break;
     }
     return res;
 }
@@ -168,18 +190,29 @@ float* init_qmatrix(QMatrix *w, float *ptr) {
     w->n_cols = *((int32_t*)ptr);
     ptr += 1;
 
-    if(w->qtype == Q8_A_TYPE) {
-        w->u.q8a.scales = ptr;
-        ptr += (w->n_rows/QK) * w->n_cols;
-        w->u.q8a.q = (int8_t*)ptr;
-        ptr += ((w->n_rows * w->n_cols) / sizeof(float));
-    } else {
-        w->u.q8b.scales = ptr;
-        ptr += (w->n_cols/QK) * w->n_rows;
-        w->u.q8b.means = ptr;
-        ptr += (w->n_cols/QK) * w->n_rows;
-        w->u.q8b.q = (int8_t*)ptr;
-        ptr += ((w->n_rows * w->n_cols) / sizeof(float));
+    switch(w->qtype) {
+        case Q8_A_TYPE:
+            w->u.q8a.scales = ptr;
+            ptr += (w->n_rows/QK) * w->n_cols;
+            w->u.q8a.q = (int8_t*)ptr;
+            ptr += ((w->n_rows * w->n_cols) / sizeof(float));
+            break;
+
+        case Q8_B_TYPE:
+            w->u.q8b.scales = ptr;
+            ptr += (w->n_cols/QK) * w->n_rows;
+            w->u.q8b.means = ptr;
+            ptr += (w->n_cols/QK) * w->n_rows;
+            w->u.q8b.q = (int8_t*)ptr;
+            ptr += ((w->n_rows * w->n_cols) / sizeof(float));
+            break;
+
+        case Q4_A_TYPE:
+            w->u.q4a.bins = ptr;
+            ptr += (w->n_cols/QK/2) * w->n_rows * 16;
+            w->u.q4a.q = (uint8_t*)ptr;
+            ptr += ((w->n_rows * w->n_cols/2) / sizeof(float));
+            break;
     }
     return ptr;
 }
@@ -279,20 +312,6 @@ void softmax(float* x, int size) {
     // normalize
     for (int i = 0; i < size; i++) {
         x[i] /= sum;
-    }
-}
-
-void matmul(float* xout, float* x, float* w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val;
     }
 }
 
