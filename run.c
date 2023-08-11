@@ -59,7 +59,7 @@ typedef struct {
 
 } QMatrix;
 
-#define QK          64          // Quantized block size, floats
+#define QK          128         // Quantized block size, floats
 #define Q8_A_TYPE   0x615f3871  // ASCII 'q8_a'
 #define Q8_B_TYPE   0x625f3871  // ASCII 'q8_b'
 #define Q4_A_TYPE   0x615f3471  // ASCII 'q4_a'

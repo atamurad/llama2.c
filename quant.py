@@ -3,7 +3,7 @@ import struct
 import sys
 import math
 
-QK = 64
+QK = 128
 
 
 def quantize_q8_a(m, f):
