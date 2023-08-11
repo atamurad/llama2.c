@@ -38,14 +38,37 @@ typedef struct {
     int n_rows;
     int n_cols;
 
-    struct {
-        float *scales; // (n_rows / QK, n_cols)
-        int8_t *q;
-    } q8;
+    union {
+        struct {
+            float *scales; // (n_rows / QK, n_cols)
+            int8_t *q;
+        } q8a;
+
+       struct {
+            float *scales; // (n_rows / QK, n_cols)
+            float *means; // (n_rows / QK, n_cols)
+            int8_t *q;
+        } q8b;
+    } u;
+
 } QMatrix;
 
-#define QK 64
-#define Q8_INDEX(w, i, j) (w->q8.scales[(i/QK)*w->n_cols + j] * w->q8.q[(i * w->n_cols + j)])
+#define QK          64          // Quantized block size, floats
+#define Q8_A_TYPE   0x615f3871  // ASCII 'q8_a'
+
+inline float q_index_float(QMatrix *w, int i, int j)
+{
+    float res;
+    // q8_a
+    if(w->qtype == Q8_A_TYPE) {
+        res = (w->u.q8a.scales[(i/QK)*w->n_cols + j]/127.0) * w->u.q8a.q[(i * w->n_cols + j)];
+    } else {
+        int idx = i*(w->n_cols/QK)+j/QK;
+        res = (w->u.q8b.scales[idx]/127.0) * w->u.q8b.q[i*w->n_cols+j] + w->u.q8b.means[idx];
+    }
+    return res;
+}
+
 
 typedef struct {
     // token embedding table
@@ -59,9 +82,9 @@ typedef struct {
     QMatrix *wv; // (layer, dim, dim)
     QMatrix *wo; // (layer, dim, dim)
     // weights for ffn
-    float* w1; // (layer, hidden_dim, dim)
-    float* w2; // (layer, dim, hidden_dim)
-    float* w3; // (layer, hidden_dim, dim)
+    QMatrix* w1; // (layer, hidden_dim, dim)
+    QMatrix* w2; // (layer, dim, hidden_dim)
+    QMatrix* w3; // (layer, hidden_dim, dim)
     // final rmsnorm
     float* rms_final_weight; // (dim,)
     // freq_cis for RoPE relatively positional embeddings
@@ -136,8 +159,8 @@ void free_run_state(RunState* s) {
 
 // ----------------------------------------------------------------------------
 // initialization: read from checkpoint
+
 float* init_qmatrix(QMatrix *w, float *ptr) {
-    // init header
     w->qtype = *((int32_t*)ptr);
     ptr += 1;
     w->n_rows = *((int32_t*)ptr);
@@ -145,10 +168,19 @@ float* init_qmatrix(QMatrix *w, float *ptr) {
     w->n_cols = *((int32_t*)ptr);
     ptr += 1;
 
-    w->q8.scales = ptr;
-    ptr += (w->n_rows/QK) * w->n_cols;
-    w->q8.q = (int8_t*)ptr;
-    ptr += ((w->n_rows * w->n_cols) / sizeof(float));
+    if(w->qtype == Q8_A_TYPE) {
+        w->u.q8a.scales = ptr;
+        ptr += (w->n_rows/QK) * w->n_cols;
+        w->u.q8a.q = (int8_t*)ptr;
+        ptr += ((w->n_rows * w->n_cols) / sizeof(float));
+    } else {
+        w->u.q8b.scales = ptr;
+        ptr += (w->n_cols/QK) * w->n_rows;
+        w->u.q8b.means = ptr;
+        ptr += (w->n_cols/QK) * w->n_rows;
+        w->u.q8b.q = (int8_t*)ptr;
+        ptr += ((w->n_rows * w->n_cols) / sizeof(float));
+    }
     return ptr;
 }
 
@@ -179,12 +211,16 @@ void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f, int sha
     w->rms_ffn_weight = ptr;
     ptr += p->n_layers * p->dim;
 
-    w->w1 = ptr;
-    ptr += p->n_layers * p->dim * p->hidden_dim;
-    w->w2 = ptr;
-    ptr += p->n_layers * p->hidden_dim * p->dim;
-    w->w3 = ptr;
-    ptr += p->n_layers * p->dim * p->hidden_dim;
+    w->w1 = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++)
+        ptr = init_qmatrix(w->w1+i, ptr);
+    w->w2 = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++)
+        ptr = init_qmatrix(w->w2+i, ptr);
+    w->w3 = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++)
+        ptr = init_qmatrix(w->w3+i, ptr);
+
     w->rms_final_weight = ptr;
     ptr += p->dim;
     w->freq_cis_real = ptr;
@@ -260,7 +296,7 @@ void qmatmul(float *xout, float *x, QMatrix *w)
     for (i = 0; i < w->n_rows; i++) {
         float val = 0.0f;
         for (int j = 0; j < w->n_cols; j++) {
-            val += Q8_INDEX(w, i, j) * x[j];
+            val += q_index_float(w, i, j) * x[j];
         }
         xout[i] = val;
     }
@@ -366,8 +402,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+        qmatmul(s->hb, s->xb, w->w1 + l);
+        qmatmul(s->hb2, s->xb, w->w3 + l);
 
         // F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
         for (int i = 0; i < hidden_dim; i++) {
@@ -380,7 +416,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         }
 
         // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+        qmatmul(s->xb, s->hb, w->w2 + l);
 
         // residual connection
         accum(x, s->xb, dim);

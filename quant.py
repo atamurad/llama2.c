@@ -5,7 +5,7 @@ import sys
 QK = 64
 
 
-def quantize(m, f):
+def quantize_q8_a(m, f):
     # check if m is 2D / matrix
     assert(len(m.shape) == 2)
 
@@ -22,16 +22,16 @@ def quantize(m, f):
             # find max absolute value in sliced block
             scales[i][j] = np.max(np.abs(m[i:i+QK, j]))
     # we want to map qs to -128..127 range
-    scales /= 128.0
     # convert to int8
-    q = np.zeros([n_rows, n_cols], np.int8)
+    q = np.zeros([n_rows, n_cols], np.float32)
     for i in range(n_rows):
         for j in range(n_cols):
-            q[i][j] = m[i][j] / scales[i//QK][j]
+            q[i][j] = m[i][j] * (127.0/scales[i//QK][j])
+    q = np.clip(q, -128, 127).astype(np.int8)
 
     # serialize to file
     # write header: magic 4 byte data type, n_rows, n_cols
-    fout.write(b"q8_0")
+    fout.write(b"q8_a")
     fout.write(struct.pack('ii', n_rows, n_cols))
     # scales
     scales = scales.flatten()
@@ -41,11 +41,45 @@ def quantize(m, f):
     fout.write(struct.pack(f'{len(q)}b', *q))
 
 
-def test_quantize():
-    fout = open("test.q8", "wb")
-    m = np.random.rand(512, 512)
-    quantize(m, fout)
-    fout.close()
+def quantize_q8_b(m, f):
+    # check if m is 2D / matrix
+    assert(len(m.shape) == 2)
+
+    n_rows = m.shape[0]
+    n_cols = m.shape[1]
+
+    # check number of rows is divisible by QK
+    assert(n_cols % QK == 0)
+
+    # find scales
+    scales = np.zeros([n_rows, n_cols//QK], np.float32)
+    means = np.zeros([n_rows, n_cols//QK], np.float32)
+    for i in range(n_rows):
+        for j in range(n_cols//QK):
+            # find max absolute value in sliced block
+            means[i][j] = np.mean(m[i, j*QK:(j+1)*QK])
+            scales[i][j] = np.max(np.abs(m[i, j*QK:(j+1)*QK] - means[i][j]))
+    # we want to map qs to -128..127 range
+    # convert to int8
+    q = np.zeros([n_rows, n_cols], np.float32)
+    for i in range(n_rows):
+        for j in range(n_cols):
+            q[i][j] = (m[i][j] - means[i][j//QK]) * (127.0 / scales[i][j//QK])
+
+    q = np.clip(q, -128, 127).astype(np.int8)
+
+    # serialize to file
+    # write header: magic 4 byte data type, n_rows, n_cols
+    fout.write(b"q8_b")
+    fout.write(struct.pack('ii', n_rows, n_cols))
+    # scales
+    scales = scales.flatten()
+    fout.write(struct.pack(f'{len(scales)}f', *scales))
+    means = means.flatten()
+    fout.write(struct.pack(f'{len(means)}f', *means))
+    # quantized values
+    q = q.flatten()
+    fout.write(struct.pack(f'{len(q)}b', *q))
 
 
 if len(sys.argv) != 3:
@@ -73,14 +107,32 @@ print(f"vocab = {n_vocab}")
 
 # skip embedding matrix
 fout.write(f.read(dim*n_vocab*4))
-# skip rms weights
+# skip rms attn weights
 fout.write(f.read(dim*n_layers*4))
 
 for label in ["WQ", "WK", "WV", "WO"]:
     for i in range(n_layers):
         print(f"Quantizing {label} - layer {i}")
         w = np.fromfile(f, dtype=np.float32, count=dim*dim).reshape((dim, dim))
-        quantize(w, fout)
+        quantize_q8_a(w, fout)
+
+# skip rms ffn weights
+fout.write(f.read(dim*n_layers*4))
+
+for i in range(n_layers):
+    print(f"Quantizing w1 - layer {i}")
+    w = np.fromfile(f, dtype=np.float32, count=dim*hidden_dim).reshape((hidden_dim, dim))
+    quantize_q8_b(w, fout)
+
+for i in range(n_layers):
+    print(f"Quantizing w2 - layer {i}")
+    w = np.fromfile(f, dtype=np.float32, count=hidden_dim*dim).reshape((dim, hidden_dim))
+    quantize_q8_b(w, fout)
+
+for i in range(n_layers):
+    print(f"Quantizing w3 - layer {i}")
+    w = np.fromfile(f, dtype=np.float32, count=dim*hidden_dim).reshape((hidden_dim, dim))
+    quantize_q8_b(w, fout)
 
 # copy rest of file
 rest = f.read()
