@@ -105,8 +105,11 @@ print(f"dim = {dim}")
 print(f"layers = {n_layers}")
 print(f"vocab = {n_vocab}")
 
-# skip embedding matrix
-fout.write(f.read(dim*n_vocab*4))
+# quantize embedding matrix
+print("Quantizing token embedding")
+w = np.fromfile(f, dtype=np.float32, count=dim*n_vocab).reshape((n_vocab, dim))
+quantize_q8_b(w, fout)
+
 # skip rms attn weights
 fout.write(f.read(dim*n_layers*4))
 

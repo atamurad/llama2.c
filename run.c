@@ -72,7 +72,7 @@ inline float q_index_float(QMatrix *w, int i, int j)
 
 typedef struct {
     // token embedding table
-    float* token_embedding_table;    // (vocab_size, dim)
+    QMatrix* token_embedding_table;    // (vocab_size, dim)
     // weights for rmsnorms
     float* rms_att_weight; // (layer, dim) rmsnorm weights
     float* rms_ffn_weight; // (layer, dim)
@@ -91,7 +91,7 @@ typedef struct {
     float* freq_cis_real; // (seq_len, head_size/2)
     float* freq_cis_imag; // (seq_len, head_size/2)
     // (optional) classifier weights for the logits, on the last layer
-    float* wcls;
+    QMatrix* wcls;
 } TransformerWeights;
 
 typedef struct {
@@ -187,8 +187,9 @@ float* init_qmatrix(QMatrix *w, float *ptr) {
 
 void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f, int shared_weights) {
     float* ptr = f;
-    w->token_embedding_table = ptr;
-    ptr += p->vocab_size * p->dim;
+    w->token_embedding_table = malloc(sizeof(QMatrix));
+    ptr = init_qmatrix(w->token_embedding_table, ptr);
+
     w->rms_att_weight = ptr;
     ptr += p->n_layers * p->dim;
 
@@ -228,7 +229,13 @@ void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f, int sha
     ptr += p->seq_len * head_size / 2;
     w->freq_cis_imag = ptr;
     ptr += p->seq_len * head_size / 2;
-    w->wcls = shared_weights ? w->token_embedding_table : ptr;
+
+    if(shared_weights) {
+        w->wcls = w->token_embedding_table;
+    } else {
+        w->wcls = malloc(sizeof(QMatrix));
+        ptr = init_qmatrix(w->wcls, ptr);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -312,8 +319,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     int head_size = dim / p->n_heads;
 
     // copy the token embedding into x
-    float* content_row = &(w->token_embedding_table[token * dim]);
-    memcpy(x, content_row, dim*sizeof(*x));
+    for(int i=0; i<dim; i++)
+        x[i] = q_index_float(w->token_embedding_table, token, i);
 
     // pluck out the "pos" row of freq_cis_real and freq_cis_imag
     float* freq_cis_real_row = w->freq_cis_real + pos * head_size / 2;
@@ -426,7 +433,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    qmatmul(s->logits, x, w->wcls);
 }
 
 // ----------------------------------------------------------------------------
