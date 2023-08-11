@@ -178,7 +178,7 @@ print(f"vocab = {n_vocab}")
 # quantize embedding matrix
 print("Quantizing token embedding")
 w = np.fromfile(f, dtype=np.float32, count=dim*n_vocab).reshape((n_vocab, dim))
-quantize_q8_b(w, fout)
+quantize_q4_a(w, fout)
 
 # skip rms attn weights
 fout.write(f.read(dim*n_layers*4))
@@ -195,17 +195,17 @@ fout.write(f.read(dim*n_layers*4))
 for i in range(n_layers):
     print(f"Quantizing w1 - layer {i}")
     w = np.fromfile(f, dtype=np.float32, count=dim*hidden_dim).reshape((hidden_dim, dim))
-    quantize_q8_b(w, fout)
+    quantize_q4_a(w, fout)
 
 for i in range(n_layers):
     print(f"Quantizing w2 - layer {i}")
     w = np.fromfile(f, dtype=np.float32, count=hidden_dim*dim).reshape((dim, hidden_dim))
-    quantize_q8_b(w, fout)
+    quantize_q4_a(w, fout)
 
 for i in range(n_layers):
     print(f"Quantizing w3 - layer {i}")
     w = np.fromfile(f, dtype=np.float32, count=dim*hidden_dim).reshape((hidden_dim, dim))
-    quantize_q8_b(w, fout)
+    quantize_q4_a(w, fout)
 
 # copy rest of file
 rest = f.read()
