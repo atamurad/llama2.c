@@ -34,16 +34,30 @@ typedef struct {
 } Config;
 
 typedef struct {
+    int qtype;
+    int n_rows;
+    int n_cols;
+
+    struct {
+        float *scales; // (n_rows / QK, n_cols)
+        int8_t *q;
+    } q8;
+} QMatrix;
+
+#define QK 64
+#define Q8_INDEX(w, i, j) (w->q8.scales[(i/QK)*w->n_cols + j] * w->q8.q[(i * w->n_cols + j)])
+
+typedef struct {
     // token embedding table
     float* token_embedding_table;    // (vocab_size, dim)
     // weights for rmsnorms
     float* rms_att_weight; // (layer, dim) rmsnorm weights
     float* rms_ffn_weight; // (layer, dim)
     // weights for matmuls
-    float* wq; // (layer, dim, dim)
-    float* wk; // (layer, dim, dim)
-    float* wv; // (layer, dim, dim)
-    float* wo; // (layer, dim, dim)
+    QMatrix *wq; // (layer, dim, dim)
+    QMatrix *wk; // (layer, dim, dim)
+    QMatrix *wv; // (layer, dim, dim)
+    QMatrix *wo; // (layer, dim, dim)
     // weights for ffn
     float* w1; // (layer, hidden_dim, dim)
     float* w2; // (layer, dim, hidden_dim)
@@ -122,6 +136,22 @@ void free_run_state(RunState* s) {
 
 // ----------------------------------------------------------------------------
 // initialization: read from checkpoint
+float* init_qmatrix(QMatrix *w, float *ptr) {
+    // init header
+    w->qtype = *((int32_t*)ptr);
+    ptr += 1;
+    w->n_rows = *((int32_t*)ptr);
+    ptr += 1;
+    w->n_cols = *((int32_t*)ptr);
+    ptr += 1;
+
+    w->q8.scales = ptr;
+    ptr += (w->n_rows/QK) * w->n_cols;
+    w->q8.q = (int8_t*)ptr;
+    ptr += ((w->n_rows * w->n_cols) / sizeof(float));
+    return ptr;
+}
+
 
 void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f, int shared_weights) {
     float* ptr = f;
@@ -129,16 +159,26 @@ void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f, int sha
     ptr += p->vocab_size * p->dim;
     w->rms_att_weight = ptr;
     ptr += p->n_layers * p->dim;
-    w->wq = ptr;
-    ptr += p->n_layers * p->dim * p->dim;
-    w->wk = ptr;
-    ptr += p->n_layers * p->dim * p->dim;
-    w->wv = ptr;
-    ptr += p->n_layers * p->dim * p->dim;
-    w->wo = ptr;
-    ptr += p->n_layers * p->dim * p->dim;
+
+    w->wq = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++) 
+        ptr = init_qmatrix(w->wq+i, ptr);
+
+    w->wk = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++)
+        ptr = init_qmatrix(w->wk+i, ptr);
+
+    w->wv = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++)
+        ptr = init_qmatrix(w->wv+i, ptr);
+
+    w->wo = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++)
+        ptr = init_qmatrix(w->wo+i, ptr);
+
     w->rms_ffn_weight = ptr;
     ptr += p->n_layers * p->dim;
+
     w->w1 = ptr;
     ptr += p->n_layers * p->dim * p->hidden_dim;
     w->w2 = ptr;
@@ -213,6 +253,20 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
+void qmatmul(float *xout, float *x, QMatrix *w)
+{
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < w->n_rows; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < w->n_cols; j++) {
+            val += Q8_INDEX(w, i, j) * x[j];
+        }
+        xout[i] = val;
+    }
+}
+
+
 void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights* w) {
 
     // a few convenience variables
@@ -236,9 +290,9 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
 
         // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l*dim*dim, dim, dim);
-        matmul(s->v, s->xb, w->wv + l*dim*dim, dim, dim);
+        qmatmul(s->q, s->xb, w->wq+l);
+        qmatmul(s->k, s->xb, w->wk+l);
+        qmatmul(s->v, s->xb, w->wv+l);
 
         // RoPE relative positional encoding: complex-valued rotate q and k by freq_cis in each head
         for (int i = 0; i < dim; i+=2) {
@@ -302,7 +356,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         }
 
         // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        qmatmul(s->xb2, s->xb, w->wo+l);
 
         // residual connection back into x
         accum(x, s->xb2, dim);
