@@ -1,12 +1,12 @@
 import numpy as np
 import struct
-import os
+import sys
 
 QK = 64
 
 
 def quantize(m, f):
-    # check m is 2D matrix
+    # check if m is 2D / matrix
     assert(len(m.shape) == 2)
 
     n_rows = m.shape[0]
@@ -48,14 +48,22 @@ def test_quantize():
     fout.close()
 
 
-f = open("out110m/model110m.bin", "rb")
-fout = open("model110.q8", "wb")
+if len(sys.argv) != 3:
+    print("quant.py <input model.bin file> <out model.q8 file>")
+    sys.exit(1)
+
+infile = sys.argv[1]
+outfile = sys.argv[2]
+
+f = open(infile, "rb")
+fout = open(outfile, "wb")
 
 header = f.read(7*4)
 fout.write(header)
 
 header = struct.unpack("iiiiiii", header)
 dim = header[0]
+hidden_dim = header[1]
 n_layers = header[2]
 n_vocab = header[5]
 
@@ -76,7 +84,5 @@ for label in ["WQ", "WK", "WV", "WO"]:
 
 # copy rest of file
 rest = f.read()
-print(f"rest of file {len(rest)}")
 fout.write(rest)
 fout.close()
-
