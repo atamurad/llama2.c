@@ -169,7 +169,14 @@ header = struct.unpack("iiiiiii", header)
 dim = header[0]
 hidden_dim = header[1]
 n_layers = header[2]
+n_heads = header[2]
 n_vocab = header[5]
+seq_len = header[6]
+
+shared_weights = False
+if n_vocab < 0:
+    shared_weights = True
+    n_vocab = -n_vocab
 
 print(f"dim = {dim}")
 print(f"layers = {n_layers}")
@@ -178,7 +185,7 @@ print(f"vocab = {n_vocab}")
 # quantize embedding matrix
 print("Quantizing token embedding")
 w = np.fromfile(f, dtype=np.float32, count=dim*n_vocab).reshape((n_vocab, dim))
-quantize_q4_a(w, fout)
+quantize_q8_b(w, fout)
 
 # skip rms attn weights
 fout.write(f.read(dim*n_layers*4))
@@ -187,7 +194,7 @@ for label in ["WQ", "WK", "WV", "WO"]:
     for i in range(n_layers):
         print(f"Quantizing {label} - layer {i}")
         w = np.fromfile(f, dtype=np.float32, count=dim*dim).reshape((dim, dim))
-        quantize_q4_a(w, fout)
+        quantize_q8_a(w, fout)
 
 # skip rms ffn weights
 fout.write(f.read(dim*n_layers*4))
@@ -195,19 +202,34 @@ fout.write(f.read(dim*n_layers*4))
 for i in range(n_layers):
     print(f"Quantizing w1 - layer {i}")
     w = np.fromfile(f, dtype=np.float32, count=dim*hidden_dim).reshape((hidden_dim, dim))
-    quantize_q4_a(w, fout)
+    quantize_q8_b(w, fout)
 
 for i in range(n_layers):
     print(f"Quantizing w2 - layer {i}")
     w = np.fromfile(f, dtype=np.float32, count=hidden_dim*dim).reshape((dim, hidden_dim))
-    quantize_q4_a(w, fout)
+    quantize_q8_b(w, fout)
 
 for i in range(n_layers):
     print(f"Quantizing w3 - layer {i}")
     w = np.fromfile(f, dtype=np.float32, count=dim*hidden_dim).reshape((hidden_dim, dim))
-    quantize_q4_a(w, fout)
+    quantize_q8_b(w, fout)
 
-# copy rest of file
+# skip rms final weights
+fout.write(f.read(dim*4))
+
+# skip rope/freq coeffs
+head_size = dim // n_heads
+fout.write(f.read(seq_len*head_size*4))
+
+# quantize embedding matrix
+if shared_weights:
+    print("Quantizing wcls")
+    w = np.fromfile(f, dtype=np.float32, count=dim*n_vocab).reshape((n_vocab, dim))
+    quantize_q8_b(w, fout)
+
+# copy rest of file -
+# by now nothing should be there..
 rest = f.read()
+print(f"left {len(rest)} bytes.")
 fout.write(rest)
 fout.close()
