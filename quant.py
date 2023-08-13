@@ -2,11 +2,12 @@ import numpy as np
 import struct
 import sys
 import math
+from multiprocessing import Pool
 
 QK = 128
 
 
-def quantize_q8_a(m, f):
+def quantize_q8_a(m):
     # check if m is 2D / matrix
     assert(len(m.shape) == 2)
 
@@ -30,6 +31,13 @@ def quantize_q8_a(m, f):
             q[i][j] = m[i][j] * (127.0/scales[i//QK][j])
     q = np.clip(q, -128, 127).astype(np.int8)
 
+    return (q, scales)
+
+def export_q8_a(res, f):
+    (q, scales) = res
+    n_rows = q.shape[0]
+    n_cols = q.shape[1]
+
     # serialize to file
     # write header: magic 4 byte data type, n_rows, n_cols
     fout.write(b"q8_a")
@@ -42,7 +50,7 @@ def quantize_q8_a(m, f):
     fout.write(struct.pack(f'{len(q)}b', *q))
 
 
-def quantize_q8_b(m, f):
+def quantize_q8_b(m):
     # check if m is 2D / matrix
     assert(len(m.shape) == 2)
 
@@ -68,6 +76,13 @@ def quantize_q8_b(m, f):
             q[i][j] = (m[i][j] - means[i][j//QK]) * (127.0 / scales[i][j//QK])
 
     q = np.clip(q, -128, 127).astype(np.int8)
+    return (q, scales, means)
+
+
+def export_q8_b(res, f):
+    (q, scales, means) = res
+    n_rows = q.shape[0]
+    n_cols = q.shape[1]
 
     # serialize to file
     # write header: magic 4 byte data type, n_rows, n_cols
@@ -159,6 +174,8 @@ if len(sys.argv) != 3:
 infile = sys.argv[1]
 outfile = sys.argv[2]
 
+pool = Pool(32)
+
 f = open(infile, "rb")
 fout = open(outfile, "wb")
 
@@ -185,34 +202,48 @@ print(f"vocab = {n_vocab}")
 # quantize embedding matrix
 print("Quantizing token embedding")
 w = np.fromfile(f, dtype=np.float32, count=dim*n_vocab).reshape((n_vocab, dim))
-quantize_q8_b(w, fout)
+export_q8_b(quantize_q8_b(w), fout)
 
 # skip rms attn weights
 fout.write(f.read(dim*n_layers*4))
 
+
+qs = []
 for label in ["WQ", "WK", "WV", "WO"]:
     for i in range(n_layers):
         print(f"Quantizing {label} - layer {i}")
         w = np.fromfile(f, dtype=np.float32, count=dim*dim).reshape((dim, dim))
-        quantize_q8_a(w, fout)
+        qs.append(pool.apply_async(quantize_q8_a, (w,)))
+for res in qs:
+    export_q8_a(res.get(), fout)
 
 # skip rms ffn weights
 fout.write(f.read(dim*n_layers*4))
 
+qs = []
 for i in range(n_layers):
     print(f"Quantizing w1 - layer {i}")
     w = np.fromfile(f, dtype=np.float32, count=dim*hidden_dim).reshape((hidden_dim, dim))
-    quantize_q8_b(w, fout)
+    qs.append(pool.apply_async(quantize_q8_b, (w,)))
+for res in qs:
+    export_q8_b(res.get(), fout)
 
+qs = []
 for i in range(n_layers):
     print(f"Quantizing w2 - layer {i}")
     w = np.fromfile(f, dtype=np.float32, count=hidden_dim*dim).reshape((dim, hidden_dim))
-    quantize_q8_b(w, fout)
+    qs.append(pool.apply_async(quantize_q8_b, (w,)))
+for res in qs:
+    export_q8_b(res.get(), fout)
 
+qs = []
 for i in range(n_layers):
     print(f"Quantizing w3 - layer {i}")
     w = np.fromfile(f, dtype=np.float32, count=dim*hidden_dim).reshape((hidden_dim, dim))
-    quantize_q8_b(w, fout)
+    qs.append(pool.apply_async(quantize_q8_b, (w,)))
+for res in qs:
+    export_q8_b(res.get(), fout)
+
 
 # skip rms final weights
 fout.write(f.read(dim*4))
@@ -225,7 +256,7 @@ fout.write(f.read(seq_len*head_size*4))
 if shared_weights:
     print("Quantizing wcls")
     w = np.fromfile(f, dtype=np.float32, count=dim*n_vocab).reshape((n_vocab, dim))
-    quantize_q8_b(w, fout)
+    export_q8_b(quantize_q8_b(w), fout)
 
 # copy rest of file -
 # by now nothing should be there..
@@ -233,3 +264,5 @@ rest = f.read()
 print(f"left {len(rest)} bytes.")
 fout.write(rest)
 fout.close()
+
+pool.close()
