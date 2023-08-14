@@ -50,6 +50,11 @@ jobs:
         run: |
           make runfast
 
+      - name: Build run.so
+        id: make_build_runso
+        run: |
+          make run.so
+
       - name: Test with pytest
         run: |
           pytest

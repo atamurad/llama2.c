@@ -45,6 +45,10 @@ rungnu:
 runompgnu:
 	$(CC) -Ofast -fopenmp -std=gnu11 run.c  -lm  -o run
 
+.PHONY: run.so
+run.so: run.c
+	$(CC) -fPIC -shared -Ofast -o run.so run.c -lm
+
 .PHONY: clean
 clean:
 	rm -f run

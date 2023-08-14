@@ -12,6 +12,10 @@ import torch
 from model import ModelArgs, Transformer
 from tokenizer import Tokenizer
 
+import sentencepiece as spm
+from ctypes import c_char_p, c_int, c_uint, c_float, cdll, byref, POINTER
+
+
 # -----------------------------------------------------------------------------
 # test utilities
 
@@ -34,6 +38,13 @@ def attempt_download_files():
         filename = os.path.join(test_ckpt_dir, file)
         if not os.path.exists(filename):
             download_file(url, filename)
+
+def load_runc():
+    runc = cdll.LoadLibrary("./run.so")
+    runc.load_tokenizer.argtype = [c_char_p, c_int, POINTER(c_char_p), POINTER(c_float), POINTER(c_int)]
+    runc.bpe_encode.argtype = [c_char_p, POINTER(c_char_p), POINTER(c_float), c_int, c_uint, POINTER(c_int), POINTER(c_int)]
+    return runc
+
 
 expected_stdout = b'Once upon a time, there was a little girl named Lily. She loved to play outside in the park. One day, she saw a big, red ball. She wanted to play with it, but it was too high.\nLily\'s mom said, "Lily, let\'s go to the park." Lily was sad and didn\'t know what to do. She said, "I want to play with your ball, but I can\'t find it."\nLily was sad and didn\'t know what to do. She said, "I\'m sorry, Lily. I didn\'t know what to do."\nLily didn\'t want to help her mom, so she'
 
@@ -83,3 +94,91 @@ def test_python():
     text = text.encode('ascii') # turn into bytes
 
     assert text == expected_stdout
+
+
+# -----------------------------------------------------------------------------
+# bpe tokenizer tests
+
+test_prompts = ["hello world!",
+                "abcdefgh",
+                "0123456789",
+                "Lets try ö & 株式会社",
+                "𒎗𓐍",
+                "[INST]\n<<<SYS>>>test<<</SYS>>>\nhello[/INST]\n"]
+
+
+def test_load_tokenizer():
+    """Loads tok512.bin with run.c, tok512.model with sentencepiece and compare all tokens and scores"""
+    attempt_download_files()
+
+    tokenizer_path = os.path.join(test_ckpt_dir, "tok512.bin")
+    tokenizer_model_path = os.path.join(test_ckpt_dir, "tok512.model")
+
+    runc = load_runc()
+
+    # load tokenizer with run.c
+    vocab_size = 512
+    vocab = (c_char_p * vocab_size)()
+    vocab_scores = (c_float * vocab_size)()
+    max_token_len = c_int()
+
+    runc.load_tokenizer(tokenizer_path.encode(), vocab_size, vocab, vocab_scores, byref(max_token_len))
+
+    assert max_token_len.value == 7
+
+    # load tokenizer with sentencepiece
+    s = spm.SentencePieceProcessor(model_file=tokenizer_model_path)
+    assert vocab_size == s.vocab_size()
+
+    bos_id = s.bos_id()
+    eos_id = s.eos_id()
+
+    # compare all tokens
+    for i in range(vocab_size):
+        # tokenizer.py export does some light transofrmation
+        t = s.id_to_piece(i)
+        if i == bos_id:
+            t = '\n<s>\n'
+        elif i == eos_id:
+            t = '\n</s>\n'
+        t = t.replace('▁', ' ')
+        b = t.encode('utf-8')
+
+        assert vocab[i] == b
+        assert vocab_scores[i] == s.get_score(i)
+
+
+def test_bpe_encode():
+    """Test run.c bpe_encode() output with expected spm.encode() output for given test prompts"""
+    attempt_download_files()
+
+    tokenizer_path = os.path.join(test_ckpt_dir, "tok512.bin")
+    tokenizer_model_path = os.path.join(test_ckpt_dir, "tok512.model")
+
+    runc = load_runc()
+    # load tokenizer with run.c
+    vocab_size = 512
+    vocab = (c_char_p * vocab_size)()
+    vocab_scores = (c_float * vocab_size)()
+    max_token_len = c_int()
+    runc.load_tokenizer(tokenizer_path.encode(), vocab_size, vocab, vocab_scores, byref(max_token_len))
+
+    # load tokenizer with sentencepiece
+    s = spm.SentencePieceProcessor(model_file=tokenizer_model_path)
+
+    tokens = (c_int * 1024)()
+    n_tokens = c_int()
+
+    for prompt in test_prompts:
+        print(f"Testing bpe_encode with prompt '{prompt}'")
+        # encode with run.c
+        runc.bpe_encode(prompt.encode("utf8"), vocab, vocab_scores, vocab_size, max_token_len, tokens, byref(n_tokens))
+        # encode with spm
+        expected = s.encode(prompt)
+
+        print(f"Expected: {expected}")
+
+        assert len(expected) == n_tokens.value
+
+        for i in range(n_tokens.value):
+            assert tokens[i] == expected[i]

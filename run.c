@@ -347,6 +347,23 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 // ----------------------------------------------------------------------------
 // byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
 
+void load_tokenizer(char *tokenizer, int vocab_size, char **vocab, float* vocab_scores, unsigned int *max_token_length)
+{
+    // read in the tokenizer .bin file
+    FILE *file = fopen(tokenizer, "rb");
+    if (!file) { fprintf(stderr, "couldn't load %s\n", tokenizer); exit(EXIT_FAILURE); }
+    if (fread(max_token_length, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
+    int len;
+    for (int i = 0; i < vocab_size; i++) {
+        if (fread(vocab_scores + i, sizeof(float), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
+        if (fread(&len, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE);  }
+        vocab[i] = (char *)malloc(len + 1);
+        if (fread(vocab[i], len, 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE);  }
+        vocab[i][len] = '\0'; // add the string terminating token
+    }
+    fclose(file);
+}
+
 typedef struct {
     char *str;
     int id;
@@ -629,24 +646,10 @@ int main(int argc, char *argv[]) {
     // right now we cannot run for more than config.seq_len steps
     if (steps <= 0 || steps > config.seq_len) { steps = config.seq_len; }
 
-    // read in the tokenizer .bin file
-    char** vocab = (char**)malloc(config.vocab_size * sizeof(char*));
-    float* vocab_scores = (float*)malloc(config.vocab_size * sizeof(float));
+    char **vocab = (char**)malloc(config.vocab_size * sizeof(char*));
+    float *vocab_scores = (float*)malloc(config.vocab_size * sizeof(float));
     unsigned int max_token_length;
-    {
-        FILE *file = fopen(tokenizer, "rb");
-        if (!file) { fprintf(stderr, "couldn't load %s\n", tokenizer); return 1; }
-        if (fread(&max_token_length, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); return 1; }
-        int len;
-        for (int i = 0; i < config.vocab_size; i++) {
-            if (fread(vocab_scores + i, sizeof(float), 1, file) != 1) { fprintf(stderr, "failed read\n"); return 1;}
-            if (fread(&len, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); return 1; }
-            vocab[i] = (char *)malloc(len + 1);
-            if (fread(vocab[i], len, 1, file) != 1) { fprintf(stderr, "failed read\n"); return 1; }
-            vocab[i][len] = '\0'; // add the string terminating token
-        }
-        fclose(file);
-    }
+    load_tokenizer(tokenizer, config.vocab_size, vocab, vocab_scores, &max_token_length);
 
     // create and init the application RunState
     RunState state;
