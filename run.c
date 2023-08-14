@@ -89,8 +89,8 @@ void malloc_run_state(RunState* s, Config* p) {
     s->hb = calloc(p->hidden_dim, sizeof(float));
     s->hb2 = calloc(p->hidden_dim, sizeof(float));
     s->q = calloc(p->dim, sizeof(float));
-    s->k = calloc(p->dim, sizeof(float));
-    s->v = calloc(p->dim, sizeof(float));
+    s->k = calloc(kv_dim, sizeof(float));
+    s->v = calloc(kv_dim, sizeof(float));
     s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->probindex = calloc(p->vocab_size, sizeof(ProbIndex));
@@ -158,12 +158,6 @@ void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f, int sha
 
 // ----------------------------------------------------------------------------
 // neural net blocks
-
-void accum(float *a, float *b, int size) {
-    for (int i = 0; i < size; i++) {
-        a[i] += b[i];
-    }
-}
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
@@ -312,7 +306,9 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 
         // residual connection back into x
-        accum(x, s->xb2, dim);
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb2[i];
+        }
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
@@ -336,7 +332,9 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
         // residual connection
-        accum(x, s->xb, dim);
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb[i];
+        }
     }
 
     // final rmsnorm
@@ -519,17 +517,24 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
     // tokens that exceed probability topp. This way we never sample tokens that
     // have very low probabilities and are less likely to go "off the rails".
 
+    int n0 = 0;
     // quicksort indices in descending order of probabilities
+    // values smaller than (1 - topp) / (n - 1) cannot be part of the result
+    // so for efficiency we crop these out as candidates before sorting
+    const float cutoff = (1.0f - topp) / (n - 1);
     for (int i = 0; i < n; i++) {
-        probindex[i].index = i;
-        probindex[i].prob = probabilities[i];
+        if (probabilities[i] >= cutoff) {
+            probindex[n0].index = i;
+            probindex[n0].prob = probabilities[i];
+            n0++;
+        }
     }
-    qsort(probindex, n, sizeof(ProbIndex), compare);
+    qsort(probindex, n0, sizeof(ProbIndex), compare);
 
     // truncate the list where cumulative probability exceeds topp
     float cumulative_prob = 0.0f;
-    int last_idx = 0;
-    for (int i = 0; i < n; i++) {
+    int last_idx = n0 - 1; // in case of rounding errors consider all elements
+    for (int i = 0; i < n0; i++) {
         cumulative_prob += probindex[i].prob;
         if (cumulative_prob > topp) {
             last_idx = i;
@@ -558,7 +563,7 @@ void error_usage() {
     fprintf(stderr, "Example: run model.bin -n 256 -i \"Once upon a time\"\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <float>  temperature, default 1.0\n");
-    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling. default 1.0 (=off)\n");
+    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling. default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
     fprintf(stderr, "  -i <string> input prompt\n");
@@ -572,7 +577,7 @@ int main(int argc, char *argv[]) {
     char *checkpoint = NULL;  // e.g. out/model.bin
     char *tokenizer = "tokenizer.bin";
     float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-    float topp = 1.0f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
+    float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     rng_seed = 0; // seed rng with time by default
     int steps = 256;          // number of steps to run for
     char *prompt = NULL;      // prompt string
