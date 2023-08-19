@@ -323,7 +323,6 @@ void qmatmul(float *out, float *x, QMatrix *M)
 {
     memset(out, 0, M->n_cols*sizeof(float));
     int i;
-    #pragma omp parallel for private(i)
     for(i=0; i<M->n_rows; i++) {
         for(int j=0; j<M->n_cols; j+=8) {
             __m256 sum = _mm256_loadu_ps(out+j);
