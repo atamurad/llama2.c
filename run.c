@@ -393,19 +393,20 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         qmatmul(s->v, s->xb, w->wv + l);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
-        for (int i = 0; i < dim; i+=2) {
-            int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-            float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
-            int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-            for (int v = 0; v < rotn; v++) {
-                float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
-                float v0 = vec[i];
-                float v1 = vec[i+1];
-                vec[i]   = v0 * fcr - v1 * fci;
-                vec[i+1] = v0 * fci + v1 * fcr;
+        for (int i=0; i<p->n_heads; i++) {
+            for (int t = 0; t < head_size/2; t+=1) {
+                float freq = 1.0f / powf(10000.0f, (2*t) / (float)head_size);
+                float val = pos * freq;
+                float fcr = cosf(val);
+                float fci = sinf(val);
+                int rotn = i < p->n_kv_heads ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+                for (int v = 0; v < rotn; v++) {
+                    float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
+                    float v0 = vec[i*head_size + t];
+                    float v1 = vec[i*head_size + t+head_size/2];
+                    vec[i*head_size + t]   = v0 * fcr - v1 * fci;
+                    vec[i*head_size + t+head_size/2] = v0 * fci + v1 * fcr;
+                }
             }
         }
 
