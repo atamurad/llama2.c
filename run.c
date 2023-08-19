@@ -6,7 +6,11 @@
 #include <time.h>
 #include <math.h>
 #include <string.h>
+#include <stdint.h>
 #include <fcntl.h>
+
+#include<immintrin.h>
+
 #if defined _WIN32
     #include "win.h"
 #else
@@ -27,20 +31,59 @@ typedef struct {
 } Config;
 
 typedef struct {
+    int qtype;
+    int n_rows;
+    int n_cols;
+
+    union {
+        struct {
+            float *scales; // (n_rows / QK, n_cols)
+            int8_t *q;
+        } q8a;
+
+        struct {
+            float *scales; // (n_rows / QK, n_cols)
+            float *means; // (n_rows / QK, n_cols)
+            int8_t *q;
+        } q8b;
+
+        struct {
+            float *bins;  // (16,)
+            uint8_t *q; // 2 nibbles packed
+        } q4a;
+
+        struct {
+            float *scales;      // n_rows//QK, n_cols
+            uint32_t *qzeros;   // n_rows//QK, n_cols/2, 2 nibbles packed
+            uint32_t *q;        // n_rows, n_cols/2, 2 nibbles packed
+        } awq;
+
+    } u;
+
+} QMatrix;
+
+#define QK          128         // Quantized block size, floats
+#define Q8_A_TYPE   0x615f3871  // ASCII 'q8_a'
+#define Q8_B_TYPE   0x625f3871  // ASCII 'q8_b'
+#define Q4_A_TYPE   0x615f3471  // ASCII 'q4_a'
+#define QAW_TYPE    0x77615f71  // ASCII 'q_aw'
+ 
+
+typedef struct {
     // token embedding table
     float* token_embedding_table;    // (vocab_size, dim)
     // weights for rmsnorms
     float* rms_att_weight; // (layer, dim) rmsnorm weights
     float* rms_ffn_weight; // (layer, dim)
     // weights for matmuls. note dim == n_heads * head_size
-    float* wq; // (layer, dim, n_heads * head_size)
-    float* wk; // (layer, dim, n_kv_heads * head_size)
-    float* wv; // (layer, dim, n_kv_heads * head_size)
-    float* wo; // (layer, n_heads * head_size, dim)
+    QMatrix* wq; // (layer, dim, n_heads * head_size)
+    QMatrix* wk; // (layer, dim, n_kv_heads * head_size)
+    QMatrix* wv; // (layer, dim, n_kv_heads * head_size)
+    QMatrix* wo; // (layer, n_heads * head_size, dim)
     // weights for ffn
-    float* w1; // (layer, hidden_dim, dim)
-    float* w2; // (layer, dim, hidden_dim)
-    float* w3; // (layer, hidden_dim, dim)
+    QMatrix* w1; // (layer, hidden_dim, dim)
+    QMatrix* w2; // (layer, dim, hidden_dim)
+    QMatrix* w3; // (layer, hidden_dim, dim)
     // final rmsnorm
     float* rms_final_weight; // (dim,)
     // freq_cis for RoPE relatively positional embeddings (not used anymore)
@@ -117,28 +160,89 @@ void free_run_state(RunState* s) {
 // ----------------------------------------------------------------------------
 // initialization: read from checkpoint
 
+float* init_qmatrix(QMatrix *w, float *ptr) {
+    w->qtype = *((int32_t*)ptr);
+    ptr += 1;
+    w->n_rows = *((int32_t*)ptr);
+    ptr += 1;
+    w->n_cols = *((int32_t*)ptr);
+    ptr += 1;
+
+    int tmp;
+
+    switch(w->qtype) {
+        case Q8_A_TYPE:
+            w->u.q8a.scales = ptr;
+            ptr += (w->n_rows/QK) * w->n_cols;
+            w->u.q8a.q = (int8_t*)ptr;
+            ptr += ((w->n_rows * w->n_cols) / sizeof(float));
+            break;
+
+        case Q8_B_TYPE:
+            w->u.q8b.scales = ptr;
+            ptr += (w->n_cols/QK) * w->n_rows;
+            w->u.q8b.means = ptr;
+            ptr += (w->n_cols/QK) * w->n_rows;
+            w->u.q8b.q = (int8_t*)ptr;
+            ptr += ((w->n_rows * w->n_cols) / sizeof(float));
+            break;
+
+        case Q4_A_TYPE:
+            w->u.q4a.bins = ptr;
+            ptr += (w->n_cols/QK/2) * w->n_rows * 16;
+            w->u.q4a.q = (uint8_t*)ptr;
+            ptr += ((w->n_rows * w->n_cols/2) / sizeof(float));
+            break;
+
+        case QAW_TYPE:
+            w->u.awq.scales = ptr;
+            ptr += (w->n_rows/QK) * w->n_cols;
+            w->u.awq.qzeros = (uint32_t*)ptr;
+            ptr += ((w->n_rows/QK) * w->n_cols/8);
+            w->u.awq.q = (uint32_t*)ptr;
+            ptr += ((w->n_rows * w->n_cols/8));
+            break;
+    }
+
+    return ptr;
+}
+
 void checkpoint_init_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
     int head_size = p->dim / p->n_heads;
     w->token_embedding_table = ptr;
     ptr += p->vocab_size * p->dim;
     w->rms_att_weight = ptr;
     ptr += p->n_layers * p->dim;
-    w->wq = ptr;
-    ptr += p->n_layers * p->dim * (p->n_heads * head_size);
-    w->wk = ptr;
-    ptr += p->n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wv = ptr;
-    ptr += p->n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wo = ptr;
-    ptr += p->n_layers * (p->n_heads * head_size) * p->dim;
+
+    w->wq = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++) 
+        ptr = init_qmatrix(w->wq+i, ptr);
+
+    w->wk = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++)
+        ptr = init_qmatrix(w->wk+i, ptr);
+
+    w->wv = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++)
+        ptr = init_qmatrix(w->wv+i, ptr);
+
+    w->wo = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++)
+        ptr = init_qmatrix(w->wo+i, ptr);
+
     w->rms_ffn_weight = ptr;
     ptr += p->n_layers * p->dim;
-    w->w1 = ptr;
-    ptr += p->n_layers * p->dim * p->hidden_dim;
-    w->w2 = ptr;
-    ptr += p->n_layers * p->hidden_dim * p->dim;
-    w->w3 = ptr;
-    ptr += p->n_layers * p->dim * p->hidden_dim;
+
+    w->w1 = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++)
+        ptr = init_qmatrix(w->w1+i, ptr);
+    w->w2 = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++)
+        ptr = init_qmatrix(w->w2+i, ptr);
+    w->w3 = malloc(p->n_layers * sizeof(QMatrix));
+    for(int i=0; i<p->n_layers; i++)
+        ptr = init_qmatrix(w->w3+i, ptr);
+
     w->rms_final_weight = ptr;
     ptr += p->dim;
     w->freq_cis_real = ptr;
@@ -186,15 +290,78 @@ void softmax(float* x, int size) {
     }
 }
 
-void matmul(float* xout, float* x, float* w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
+/* unpack 8x 4bit nibbles to float32 vector */
+inline __m256 unpack(const uint32_t *packed)
+{
+    __m128i tmp = _mm_loadu_si128( ( const __m128i* )packed);
+    __m256i bytes = _mm256_cvtepu8_epi32( tmp );
+    // Unpack values into individual bytes
+    const __m256i lowMask = _mm256_set1_epi8( 0xF );
+    __m256i high = _mm256_andnot_si256( lowMask, bytes );
+    __m256i low = _mm256_and_si256( lowMask, bytes );
+    high = _mm256_srli_epi32( high, 4 );
+    bytes = _mm256_permute2x128_si256(low, high, 0x20);
+
+    const __m256i perm = _mm256_setr_epi32( 0, 2, 4, 6, 1, 3, 5, 7  );
+    bytes = _mm256_permutevar8x32_epi32( bytes, perm );
+    // convert to fp32
+    __m256 res = _mm256_cvtepi32_ps(bytes);
+    return res;
+}
+
+inline __m256 q_get_row_scaled(QMatrix *M, int i, int j, float x)
+{
+    __m256 q = unpack(M->u.awq.q      + i*(M->n_cols/8) + j/8);
+    __m256 z = unpack(M->u.awq.qzeros + (i/QK)*(M->n_cols/8) + j/8);
+    __m256 scale = _mm256_loadu_ps(M->u.awq.scales + (i/QK)*M->n_cols + j);
+    /* w = scale * (q-z) */
+    __m256 w = _mm256_mul_ps(scale, _mm256_sub_ps(q, z));
+    return _mm256_mul_ps(w, _mm256_set1_ps(x)); // w * x
+}
+
+void qmatmul(float *out, float *x, QMatrix *M)
+{
+    memset(out, 0, M->n_cols*sizeof(float));
     int i;
     #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
+    for(i=0; i<M->n_rows; i++) {
+        for(int j=0; j<M->n_cols; j+=8) {
+            __m256 sum = _mm256_loadu_ps(out+j);
+            __m256 w = q_get_row_scaled(M, i, j, x[i]);
+            sum = _mm256_add_ps(sum, w);
+            _mm256_storeu_ps(out+j, sum);
+        }
+    }
+}
+
+// AVX2 intrinsics for matmul
+void matmul(float* xout, const float* x, const float* w, int n, int d) {
+
+    int nn = n / 8 * 8;  // ensure n is a multiple of 8
+    int i;
+    #pragma omp parallel for private(i)
+    for (int i = 0; i < d; i++) {
+        __m256 sum_vec = _mm256_setzero_ps(); // for AVX2, sum of 8 floats
+        int i_n = i * n;
+        for (int j = 0; j < nn; j += 8) {
+            // Load 8 values from w and x
+            __m256 w_vec = _mm256_loadu_ps(&w[i_n + j]);
+            __m256 x_vec = _mm256_loadu_ps(&x[j]);
+            // Multiply and accumulate
+            __m256 prod_vec = _mm256_mul_ps(w_vec, x_vec);
+            sum_vec = _mm256_add_ps(sum_vec, prod_vec);
+        }
+
+        // Perform horizontal add
+        sum_vec = _mm256_hadd_ps(sum_vec, sum_vec);
+        sum_vec = _mm256_hadd_ps(sum_vec, sum_vec);
+        float vals[8];
+        _mm256_storeu_ps(vals, sum_vec);
+        float val = vals[0] + vals[4];
+
+        // handle remainder if n is not a multiple of 8
+        for (int j = nn; j < n; j++) {
+            val += w[i_n + j] * x[j];
         }
         xout[i] = val;
     }
@@ -221,9 +388,9 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
 
         // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+        qmatmul(s->q, s->xb, w->wq + l);
+        qmatmul(s->k, s->xb, w->wk + l);
+        qmatmul(s->v, s->xb, w->wv + l);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < dim; i+=2) {
@@ -290,7 +457,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         }
 
         // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        qmatmul(s->xb2, s->xb, w->wo + l);
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
@@ -302,8 +469,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+        qmatmul(s->hb, s->xb, w->w1 + l);
+        qmatmul(s->hb2, s->xb, w->w3 + l);
 
         // F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
         for (int i = 0; i < hidden_dim; i++) {
@@ -316,7 +483,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         }
 
         // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+        qmatmul(s->xb, s->hb, w->w2 + l);
 
         // residual connection
         for (int i = 0; i < dim; i++) {
@@ -695,8 +862,8 @@ int main(int argc, char *argv[]) {
         }
         pos++;
 
-        // data-dependent terminating condition: the BOS (1) token delimits sequences
-        if (next == 1) { break; }
+        // data-dependent terminating condition: the BOS (1) or EOS (2) token delimits sequences
+        if (next == 1 || next == 2) { break; }
 
         // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
         char *token_str = (token == 1 && vocab[next][0] == ' ') ? vocab[next]+1 : vocab[next];
