@@ -23,7 +23,7 @@ rundebug: run.c
 # In our specific application this is *probably* okay to use
 .PHONY: runfast
 runfast: run.c
-	$(CC) -Ofast -o run run.c -lm
+	$(CC) -Ofast -march=native -o run run.c -lm
 
 # additionally compiles with OpenMP, allowing multithreaded runs
 # make sure to also enable multiple threads when running, e.g.:
